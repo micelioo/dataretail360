@@ -36,13 +36,11 @@ Devuelve SOLO la consulta SQL sin markdown. Pregunta: {pregunta}"""
             pass
 
     # Fallback NLQ determinístico
-    if "sucursal" in p:
-        return """SELECT nombre_sucursal,
-       ROUND(SUM(monto_neto), 0) AS venta_neta_oficial,
-       ROUND(SUM(margen_ganancia) * 100.0 / SUM(monto_neto), 1) AS margen_pct
-FROM dm_ventas_consolidadas
-GROUP BY nombre_sucursal
-ORDER BY venta_neta_oficial DESC;"""
+    if "quiebre" in p or "stock" in p or "inventario" in p:
+        return """SELECT bk_sku, nombre_producto, nombre_sucursal, cantidad_stock
+FROM dm_inventario_analitico
+WHERE flag_quiebre_stock = 1
+ORDER BY bk_sku;"""
     elif "campaña" in p or "campana" in p or "roi" in p:
         return """SELECT nombre_campana, presupuesto_asignado,
        ROUND((SUM(margen_ganancia) - presupuesto_asignado) * 100.0 / presupuesto_asignado, 1) AS roi_pct
@@ -50,11 +48,13 @@ FROM dm_ventas_consolidadas
 WHERE sk_campana != -1
 GROUP BY nombre_campana, presupuesto_asignado
 ORDER BY roi_pct DESC;"""
-    elif "quiebre" in p or "stock" in p or "inventario" in p:
-        return """SELECT bk_sku, nombre_producto, nombre_sucursal, cantidad_stock
-FROM dm_inventario_analitico
-WHERE flag_quiebre_stock = 1
-ORDER BY bk_sku;"""
+    elif "sucursal" in p:
+        return """SELECT nombre_sucursal,
+       ROUND(SUM(monto_neto), 0) AS venta_neta_oficial,
+       ROUND(SUM(margen_ganancia) * 100.0 / SUM(monto_neto), 1) AS margen_pct
+FROM dm_ventas_consolidadas
+GROUP BY nombre_sucursal
+ORDER BY venta_neta_oficial DESC;"""
     else:
         return """SELECT categoria,
        ROUND(SUM(monto_neto), 0) AS venta_neta_oficial,
@@ -78,6 +78,93 @@ def auditar_sql(sql: str) -> list:
         alertas.append("Bloqueo de seguridad: solo se permiten consultas de lectura (`SELECT`).")
     return alertas
 
+def estilizar_tabla_nlq(df: pd.DataFrame):
+    """Formatea miles con puntos (estilo CLP) y aplica semáforo (rojo/amarillo/verde)."""
+    formatos = {}
+    for col in df.columns:
+        c = col.lower()
+        if any(k in c for k in ["venta", "margen_oficial", "presupuesto", "monto", "ticket"]):
+            formatos[col] = lambda x: f"${x:,.0f}".replace(",", ".") if pd.notnull(x) else ""
+        elif "pct" in c or "roi" in c:
+            formatos[col] = lambda x: f"{x:,.1f}%".replace(".", ",") if pd.notnull(x) else ""
+        elif "stock" in c or "cantidad" in c:
+            formatos[col] = lambda x: f"{x:,.0f}".replace(",", ".") if pd.notnull(x) else ""
+
+    def color_semaforo(val, col_name):
+        if not isinstance(val, (int, float)):
+            return ""
+        c = col_name.lower()
+        if "margen_pct" in c:
+            if val < 22:
+                return "background-color: #FADBD8; color: #78281F; font-weight: bold;"
+            elif val < 28:
+                return "background-color: #FCF3CF; color: #7D6608; font-weight: bold;"
+            else:
+                return "background-color: #D4EFDF; color: #145A32; font-weight: bold;"
+        elif "roi_pct" in c:
+            if val < 100:
+                return "background-color: #FADBD8; color: #78281F; font-weight: bold;"
+            elif val < 150:
+                return "background-color: #FCF3CF; color: #7D6608; font-weight: bold;"
+            else:
+                return "background-color: #D4EFDF; color: #145A32; font-weight: bold;"
+        elif "cantidad_stock" in c:
+            if val == 0:
+                return "background-color: #FADBD8; color: #78281F; font-weight: bold;"
+            elif val <= 5:
+                return "background-color: #FCF3CF; color: #7D6608; font-weight: bold;"
+            else:
+                return "background-color: #D4EFDF; color: #145A32; font-weight: bold;"
+        elif "venta_neta" in c or "margen_oficial" in c:
+            if val < 20000000:
+                return "background-color: #FADBD8; color: #78281F;"
+            elif val < 130000000:
+                return "background-color: #FCF3CF; color: #7D6608;"
+            else:
+                return "background-color: #D4EFDF; color: #145A32; font-weight: bold;"
+        return ""
+
+    styler = df.style.format(formatos)
+    for col in df.columns:
+        styler = styler.map(lambda v, col_name=col: color_semaforo(v, col_name), subset=[col])
+    return styler
+
+def graficar_resultado_nlq(df: pd.DataFrame):
+    """Genera un gráfico automático acorde a las columnas devueltas por el asistente NLQ."""
+    if df.empty or len(df.columns) < 2:
+        return
+    cols = [c.lower() for c in df.columns]
+    if "cantidad_stock" in cols and "bk_sku" in cols:
+        df_plot = df.copy()
+        df_plot["item"] = df_plot["bk_sku"] + " — " + df_plot["nombre_producto"] + " (" + df_plot["nombre_sucursal"] + ")"
+        df_plot["alerta_nivel"] = 1
+        fig = px.bar(
+            df_plot,
+            x="alerta_nivel",
+            y="item",
+            orientation="h",
+            title="Detalle visual: Productos con quiebre crítico de stock (0 unidades disponibles)",
+            labels={"alerta_nivel": "Estado: Quiebre crítico (Stock = 0)", "item": "SKU / Producto / Sucursal"}
+        )
+        fig.update_traces(marker_color=NARANJA_ALERTA, text="0 unid.", textposition="inside")
+        fig.update_xaxes(showticklabels=False)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        col_x = df.columns[0]
+        num_cols = df.select_dtypes(include="number").columns.tolist()
+        if num_cols:
+            col_y = num_cols[-1] if ("roi" in num_cols[-1].lower()) else num_cols[0]
+            fig = px.bar(
+                df,
+                x=col_x,
+                y=col_y,
+                text=col_y,
+                title=f"Visualización automática: {col_y} por {col_x}"
+            )
+            fmt = "%{text:,.1f}%" if ("pct" in col_y.lower() or "roi" in col_y.lower()) else "$%{text:,.0f}"
+            fig.update_traces(marker_color=AZUL_CORP, texttemplate=fmt, textposition="outside")
+            st.plotly_chart(fig, use_container_width=True)
+
 df_ventas, df_inv = cargar_desde_dw()
 
 st.title("DataRetail 360 - Solución analítica integrada")
@@ -90,7 +177,7 @@ with tab1:
     sel_canal = st.sidebar.multiselect("Canal", df_ventas["nombre_canal"].unique(), default=df_ventas["nombre_canal"].unique())
     sel_suc = st.sidebar.multiselect("Sucursal", df_ventas["nombre_sucursal"].unique(), default=df_ventas["nombre_sucursal"].unique())
     sel_cat = st.sidebar.multiselect("Categoría", df_ventas["categoria"].unique(), default=df_ventas["categoria"].unique())
-    sel_seg = st.sidebar.multiselect("Segmento Cliente", df_ventas["segmento_cliente"].unique(), default=df_ventas["segmento_cliente"].unique())
+    sel_seg = st.sidebar.multiselect("Segmento cliente", df_ventas["segmento_cliente"].unique(), default=df_ventas["segmento_cliente"].unique())
 
     df_v = df_ventas[
         (df_ventas["nombre_canal"].isin(sel_canal)) &
@@ -108,11 +195,11 @@ with tab1:
     rec_pct = ((compras_cli > 1).sum() / len(compras_cli) * 100) if len(compras_cli) > 0 else 0
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Venta neta total", f"${venta_neta:,.0f}", "Meta: > +8% anual")
-    c2.metric("Margen bruto %", f"{margen_pct:.1f}%", f"{margen_pct - 28:.1f} pp vs Meta (28%)")
-    c3.metric("Ticket promedio", f"${ticket_prom:,.0f}", f"{ticket_prom - 65000:,.0f} CLP vs Meta (65k)")
-    c4.metric("Quiebre de stock %", f"{quiebre_pct:.1f}%", "Meta: < 3,0%", delta_color="inverse")
-    c5.metric("Recurrencia clientes", f"{rec_pct:.1f}%", f"{rec_pct - 35:.1f} pp vs Meta (35%)")
+    c1.metric("Venta neta total", f"${venta_neta:,.0f}".replace(",", "."), "Meta: > +8% anual")
+    c2.metric("Margen bruto %", f"{margen_pct:.1f}%".replace(".", ","), f"{margen_pct - 28:.1f} pp vs Meta (28%)")
+    c3.metric("Ticket promedio", f"${ticket_prom:,.0f}".replace(",", "."), f"{ticket_prom - 65000:,.0f}".replace(",", ".") + " CLP vs Meta (65k)")
+    c4.metric("Quiebre de stock %", f"{quiebre_pct:.1f}%".replace(".", ","), "Meta: < 3,0%", delta_color="inverse")
+    c5.metric("Recurrencia clientes", f"{rec_pct:.1f}%".replace(".", ","), f"{rec_pct - 35:.1f} pp vs Meta (35%)")
 
     st.divider()
 
@@ -156,7 +243,7 @@ with tab1:
     with col3:
         st.subheader("Alerta: productos en quiebre")
         alertas = df_i[df_i["flag_quiebre_stock"] == 1][["bk_sku", "nombre_producto", "nombre_sucursal", "cantidad_stock"]]
-        st.dataframe(alertas.sort_values("bk_sku"), use_container_width=True, hide_index=True)
+        st.dataframe(estilizar_tabla_nlq(alertas.sort_values("bk_sku")), use_container_width=True, hide_index=True)
 
 with tab2:
     st.subheader("Asistente NLQ / Text-to-SQL y Auditoría de gobernanza")
@@ -180,7 +267,8 @@ with tab2:
             conn = sqlite3.connect("dataretail360.db")
             df_res = pd.read_sql_query(sql_editada, conn)
             conn.close()
-            st.dataframe(df_res, use_container_width=True, hide_index=True)
+            st.dataframe(estilizar_tabla_nlq(df_res), use_container_width=True, hide_index=True)
+            graficar_resultado_nlq(df_res)
         except Exception as e:
             st.error(f"Error de sintaxis SQL: {e}")
 
@@ -197,9 +285,9 @@ JOIN Dim_Cliente c ON v.sk_cliente = c.sk_cliente
 WHERE trimestre = 3;""", language="sql")
         st.markdown("""
         **Hallazgos:**
-        1. **Alucinación de métrica:** No divide por `1.19` (sobreestima ventas en 19% al incluir IVA).
-        2. **Fuga de privacidad (PII):** Expone `nombre_completo` y `rut` desde `Dim_Cliente`.
-        3. **Omisión SCD Tipo 2:** No filtra `es_registro_actual = 1` para productos recategorizados.
+1. **Alucinación de métrica:** No divide por `1.19` (sobreestima ventas en 19% al incluir IVA).
+2. **Fuga de privacidad (PII):** Expone `nombre_completo` y `rut` desde `Dim_Cliente`.
+3. **Omisión SCD Tipo 2:** No filtra `es_registro_actual = 1` para productos recategorizados.
         """)
 
     with c_ok:
@@ -215,4 +303,4 @@ ORDER BY venta_neta_oficial DESC;"""
         conn = sqlite3.connect("dataretail360.db")
         df_res_ref = pd.read_sql_query(sql_validada, conn)
         conn.close()
-        st.dataframe(df_res_ref, use_container_width=True, hide_index=True)
+        st.dataframe(estilizar_tabla_nlq(df_res_ref), use_container_width=True, hide_index=True)
